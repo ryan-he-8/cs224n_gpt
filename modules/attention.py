@@ -32,10 +32,40 @@ class CausalSelfAttention(nn.Module):
     return proj
 
   def attention(self, key, query, value, attention_mask):
+    '''
+    Implemented multi-head attention
+    
+    key: Key matrix (batch, head, time, dimension)
+    query: Query matrix (batch, head, time, dimension)
+    value: Value matrix (batch, head, time, dimension)
+    attention_mask: attention_mask (batch, 1, 1, time)
 
+    return shape
+    '''
     ### YOUR CODE HERE
-    raise NotImplementedError
 
+    B, H, T, D = key.shape
+
+    # Raw attention scores: [B, H, T, T]
+    scores = (query @ key.transpose(-2, -1)) * (D ** -0.5)
+
+    # Causal mask for autoregressive decoding.
+    causal_mask = torch.triu(
+      torch.ones((T, T), device=scores.device, dtype=torch.bool),
+      diagonal=1,
+    )[None, None, :, :]
+    scores = scores.masked_fill(causal_mask, float('-inf'))
+
+    # attention_mask is [B, 1, 1, T] with 0 for keep and -10000 for masked pads.
+    # Add directly to scores so it broadcasts over heads and query positions.
+    scores = scores + attention_mask
+
+    norm_scores = scores.softmax(dim=-1)
+    norm_scores = self.dropout(norm_scores)
+    attention = norm_scores @ value  # [B, H, T, D]
+
+    # Merge heads back to hidden size: [B, T, H * D].
+    return rearrange(attention, 'b h t d -> b t (h d)')
 
   def forward(self, hidden_states, attention_mask):
     """
