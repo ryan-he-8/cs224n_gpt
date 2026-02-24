@@ -33,6 +33,8 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 
 TQDM_DISABLE = False
+NO_TOKEN_ID = 3919
+YES_TOKEN_ID = 8505
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -175,15 +177,19 @@ def test(args):
   print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
   test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
 
+  # Model predicts class ids {0,1}; submission files require GPT token ids for "no"/"yes".
+  def class_to_token_id(pred):
+    return YES_TOKEN_ID if int(pred) == 1 else NO_TOKEN_ID
+
   with open(args.para_dev_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      f.write(f"{p}, {class_to_token_id(s)} \n")
 
   with open(args.para_test_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      f.write(f"{p}, {class_to_token_id(s)} \n")
 
 
 def get_args():
