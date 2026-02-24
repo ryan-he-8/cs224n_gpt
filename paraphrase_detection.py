@@ -17,6 +17,7 @@ import torch
 
 import numpy as np
 import torch.nn.functional as F
+from sklearn.metrics import f1_score, accuracy_score
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -27,7 +28,7 @@ from datasets import (
   ParaphraseDetectionTestDataset,
   load_paraphrase_data
 )
-from evaluation import model_eval_paraphrase, model_test_paraphrase
+from evaluation import model_test_paraphrase
 from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
@@ -35,6 +36,56 @@ from optimizer import AdamW
 TQDM_DISABLE = False
 NO_TOKEN_ID = 3919
 YES_TOKEN_ID = 8505
+
+
+def labels_to_class_ids(labels: torch.Tensor) -> torch.Tensor:
+  """
+  Normalize paraphrase labels to class ids in {0,1}.
+  Supports:
+    - direct class ids [0,1]
+    - token ids [3919 ("no"), 8505 ("yes")] potentially shaped [B, 1]
+  """
+  if labels.dim() > 1:
+    labels = labels[:, 0]
+  labels = labels.long().flatten()
+
+  if labels.numel() == 0:
+    return labels
+
+  is_class_id = (labels == 0) | (labels == 1)
+  if torch.all(is_class_id):
+    return labels
+
+  is_token_id = (labels == NO_TOKEN_ID) | (labels == YES_TOKEN_ID)
+  if not torch.all(is_token_id):
+    bad = labels[~is_token_id]
+    raise ValueError(
+      f"Unexpected paraphrase labels. Expected only 0/1 or {NO_TOKEN_ID}/{YES_TOKEN_ID}, "
+      f"but found values like {bad[:8].tolist()}"
+    )
+
+  return (labels == YES_TOKEN_ID).long()
+
+
+@torch.no_grad()
+def model_eval_paraphrase_local(dataloader, model, device):
+  model.eval()
+  y_true, y_pred, sent_ids = [], [], []
+  for batch in tqdm(dataloader, desc='eval', disable=TQDM_DISABLE):
+    b_ids = batch['token_ids'].to(device)
+    b_mask = batch['attention_mask'].to(device)
+    labels = labels_to_class_ids(batch['labels'])
+
+    logits = model(b_ids, b_mask).cpu().numpy()
+    preds = np.argmax(logits, axis=1).flatten()
+
+    y_true.extend(labels.cpu().numpy().flatten())
+    y_pred.extend(preds)
+    sent_ids.extend(batch['sent_ids'])
+
+  f1 = f1_score(y_true, y_pred, average='macro')
+  acc = accuracy_score(y_true, y_pred)
+  return acc, f1, y_pred, y_true, sent_ids
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -123,7 +174,10 @@ def train(args):
     num_batches = 0
     for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # Get the input and move it to the gpu (I do not recommend training this model on CPU).
-      b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
+      b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+      labels = labels_to_class_ids(batch['labels'])
+      if labels.min().item() < 0 or labels.max().item() >= 2:
+        raise ValueError(f"Invalid class labels for paraphrase task: min={labels.min().item()}, max={labels.max().item()}")
       b_ids = b_ids.to(device)
       b_mask = b_mask.to(device)
       labels = labels.to(device)
@@ -131,7 +185,6 @@ def train(args):
       # Compute the loss, gradients, and update the model's parameters.
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
-      preds = torch.argmax(logits, dim=1)
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
@@ -141,7 +194,7 @@ def train(args):
 
     train_loss = train_loss / num_batches
 
-    dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
+    dev_acc, dev_f1, *_ = model_eval_paraphrase_local(para_dev_dataloader, model, device)
 
     if dev_acc > best_dev_acc:
       best_dev_acc = dev_acc
@@ -173,7 +226,7 @@ def test(args):
   para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
                                     collate_fn=para_test_data.collate_fn)
 
-  dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
+  dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase_local(para_dev_dataloader, model, device)
   print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
   test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
 
@@ -182,14 +235,14 @@ def test(args):
     return YES_TOKEN_ID if int(pred) == 1 else NO_TOKEN_ID
 
   with open(args.para_dev_out, "w+") as f:
-    f.write(f"id \t Predicted_Is_Paraphrase \n")
+    f.write("id\tPredicted_Is_Paraphrase\n")
     for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}, {class_to_token_id(s)} \n")
+      f.write(f"{p}\t{class_to_token_id(s)}\n")
 
   with open(args.para_test_out, "w+") as f:
-    f.write(f"id \t Predicted_Is_Paraphrase \n")
+    f.write("id\tPredicted_Is_Paraphrase\n")
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
-      f.write(f"{p}, {class_to_token_id(s)} \n")
+      f.write(f"{p}\t{class_to_token_id(s)}\n")
 
 
 def get_args():
