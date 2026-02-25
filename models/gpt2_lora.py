@@ -14,13 +14,15 @@ class GPT2ModelLoRA(GPTPreTrainedModel):
   GPT-2 with optional LoRA adapters on attention projections.
   """
 
-  def __init__(self, config, lora_r=0, lora_alpha=1.0, lora_dropout=0.0, lora_target="qv"):
+  def __init__(self, config, lora_r=0, lora_alpha=1.0, lora_dropout=0.0, lora_target="qv",
+               use_flash_attention=False):
     super().__init__(config)
     self.config = config
     self.lora_r = lora_r
     self.lora_alpha = lora_alpha
     self.lora_dropout = lora_dropout
     self.lora_target = lora_target
+    self.use_flash_attention = use_flash_attention
 
     self.word_embedding = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
     self.pos_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
@@ -36,6 +38,7 @@ class GPT2ModelLoRA(GPTPreTrainedModel):
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         lora_target=lora_target,
+        use_flash_attention=use_flash_attention,
       ) for _ in range(config.num_hidden_layers)
     ])
 
@@ -80,7 +83,8 @@ class GPT2ModelLoRA(GPTPreTrainedModel):
 
   @classmethod
   def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12,
-                      lora_r=0, lora_alpha=1.0, lora_dropout=0.0, lora_target="qv"):
+                      lora_r=0, lora_alpha=1.0, lora_dropout=0.0, lora_target="qv",
+                      use_flash_attention=False):
     gpt_model = OpenAIGPT2Model.from_pretrained(model).eval()
     our_model = GPT2ModelLoRA(
       GPT2Config(hidden_size=d, num_hidden_layers=l, num_attention_heads=num_heads, intermediate_size=d * 3),
@@ -88,6 +92,7 @@ class GPT2ModelLoRA(GPTPreTrainedModel):
       lora_alpha=lora_alpha,
       lora_dropout=lora_dropout,
       lora_target=lora_target,
+      use_flash_attention=use_flash_attention,
     ).eval()
 
     our_model.word_embedding.load_state_dict(gpt_model.wte.state_dict())

@@ -114,6 +114,7 @@ class ParaphraseGPT(nn.Module):
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_target=args.lora_target,
+        use_flash_attention=args.use_flash_attention,
       )
     else:
       self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
@@ -289,6 +290,8 @@ def get_args():
   parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
   parser.add_argument("--lora_target", type=str, default="qv", choices=["q", "k", "v", "qk", "qv", "kv", "qkv"],
                       help="Which attention projections to apply LoRA to.")
+  parser.add_argument("--use_flash_attention", action='store_true',
+                      help="Use PyTorch scaled_dot_product_attention (FlashAttention-backed when supported) in LoRA GPT-2.")
 
   args = parser.parse_args()
   return args

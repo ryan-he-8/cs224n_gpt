@@ -5,7 +5,8 @@ from modules.attention_lora import CausalSelfAttentionLoRA
 
 
 class GPT2LayerLoRA(nn.Module):
-  def __init__(self, config, lora_r=0, lora_alpha=1.0, lora_dropout=0.0, lora_target="qv"):
+  def __init__(self, config, lora_r=0, lora_alpha=1.0, lora_dropout=0.0, lora_target="qv",
+               use_flash_attention=False):
     super().__init__()
     self.self_attention = CausalSelfAttentionLoRA(
       config,
@@ -13,6 +14,7 @@ class GPT2LayerLoRA(nn.Module):
       lora_alpha=lora_alpha,
       lora_dropout=lora_dropout,
       lora_target=lora_target,
+      use_flash_attention=use_flash_attention,
     )
     self.attention_dense = nn.Linear(config.hidden_size, config.hidden_size)
     self.attention_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
