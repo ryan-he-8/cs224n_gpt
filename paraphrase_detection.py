@@ -30,6 +30,7 @@ from datasets import (
 )
 from evaluation import model_test_paraphrase
 from models.gpt2 import GPT2Model
+from models.gpt2_lora import GPT2ModelLoRA
 
 from optimizer import AdamW
 
@@ -103,12 +104,31 @@ class ParaphraseGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
+    if args.use_lora:
+      self.gpt = GPT2ModelLoRA.from_pretrained(
+        model=args.model_size,
+        d=args.d,
+        l=args.l,
+        num_heads=args.num_heads,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target=args.lora_target,
+      )
+    else:
+      self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
     self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection has two outputs: 1 (yes) or 0 (no).
 
-    # By default, fine-tune the full model.
-    for param in self.gpt.parameters():
-      param.requires_grad = True
+    if args.use_lora:
+      # Freeze base model; train only LoRA adapters and the task head.
+      for param in self.gpt.parameters():
+        param.requires_grad = False
+      for name, param in self.gpt.named_parameters():
+        if "lora_" in name:
+          param.requires_grad = True
+    else:
+      for param in self.gpt.parameters():
+        param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
@@ -164,7 +184,7 @@ def train(args):
   model = model.to(device)
 
   lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
+  optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=0.)
   best_dev_acc = 0
 
   # Run for the specified number of epochs.
@@ -235,14 +255,14 @@ def test(args):
     return YES_TOKEN_ID if int(pred) == 1 else NO_TOKEN_ID
 
   with open(args.para_dev_out, "w+") as f:
-    f.write("id\tPredicted_Is_Paraphrase\n")
+    f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}\t{class_to_token_id(s)}\n")
+      f.write(f"{p}, {class_to_token_id(s)} \n")
 
   with open(args.para_test_out, "w+") as f:
-    f.write("id\tPredicted_Is_Paraphrase\n")
+    f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
-      f.write(f"{p}\t{class_to_token_id(s)}\n")
+      f.write(f"{p}, {class_to_token_id(s)} \n")
 
 
 def get_args():
@@ -263,6 +283,12 @@ def get_args():
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+  parser.add_argument("--use_lora", action='store_true', help="Enable LoRA adapters in GPT-2 attention layers.")
+  parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+  parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA scaling factor.")
+  parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
+  parser.add_argument("--lora_target", type=str, default="qv", choices=["q", "k", "v", "qk", "qv", "kv", "qkv"],
+                      help="Which attention projections to apply LoRA to.")
 
   args = parser.parse_args()
   return args
