@@ -205,12 +205,26 @@ def build_optimizer_and_scheduler(args, model, total_training_steps):
   return optimizer, scheduler
 
 
+def maybe_subsample(data, subset_size, seed, name):
+  if subset_size <= 0 or subset_size >= len(data):
+    return data
+  rng = random.Random(seed)
+  idx = list(range(len(data)))
+  rng.shuffle(idx)
+  keep = idx[:subset_size]
+  sampled = [data[i] for i in keep]
+  print(f"Using {len(sampled)}/{len(data)} examples for {name} (subset mode).")
+  return sampled
+
+
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # Create the data and its corresponding datasets and dataloader.
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
+  para_train_data = maybe_subsample(para_train_data, args.train_subset_size, args.seed, "train")
+  para_dev_data = maybe_subsample(para_dev_data, args.dev_subset_size, args.seed + 1, "dev")
 
   para_train_data = ParaphraseDetectionDataset(para_train_data, args)
   para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
@@ -327,6 +341,10 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--train_subset_size", type=int, default=0,
+                      help="If >0, train only on this many examples (for cheap hyperparameter tuning).")
+  parser.add_argument("--dev_subset_size", type=int, default=0,
+                      help="If >0, evaluate only on this many dev examples (for cheap hyperparameter tuning).")
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
