@@ -18,6 +18,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score
+from torch.optim.lr_scheduler import LambdaLR
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -72,12 +73,20 @@ def labels_to_class_ids(labels: torch.Tensor) -> torch.Tensor:
 def model_eval_paraphrase_local(dataloader, model, device):
   model.eval()
   y_true, y_pred, sent_ids = [], [], []
+  total_loss = 0.0
+  total_examples = 0
   for batch in tqdm(dataloader, desc='eval', disable=TQDM_DISABLE):
     b_ids = batch['token_ids'].to(device)
     b_mask = batch['attention_mask'].to(device)
-    labels = labels_to_class_ids(batch['labels'])
+    labels = labels_to_class_ids(batch['labels']).to(device)
 
-    logits = model(b_ids, b_mask).cpu().numpy()
+    logits_t = model(b_ids, b_mask)
+    loss = F.cross_entropy(logits_t, labels, reduction='mean')
+    batch_size = labels.shape[0]
+    total_loss += loss.item() * batch_size
+    total_examples += batch_size
+
+    logits = logits_t.cpu().numpy()
     preds = np.argmax(logits, axis=1).flatten()
 
     y_true.extend(labels.cpu().numpy().flatten())
@@ -86,7 +95,8 @@ def model_eval_paraphrase_local(dataloader, model, device):
 
   f1 = f1_score(y_true, y_pred, average='macro')
   acc = accuracy_score(y_true, y_pred)
-  return acc, f1, y_pred, y_true, sent_ids
+  avg_loss = total_loss / max(total_examples, 1)
+  return acc, f1, y_pred, y_true, sent_ids, avg_loss
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -165,6 +175,36 @@ def save_model(model, optimizer, args, filepath):
   print(f"save the model to {filepath}")
 
 
+def build_optimizer_and_scheduler(args, model, total_training_steps):
+  params = filter(lambda p: p.requires_grad, model.parameters())
+  if args.optimizer_type == "torch":
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+  else:
+    optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+
+  scheduler = None
+  if args.use_scheduler:
+    warmup_steps = max(args.warmup_steps, 0)
+    total_steps = max(total_training_steps, 1)
+
+    def lr_lambda(current_step):
+      if warmup_steps > 0 and current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+
+      if args.scheduler_type == "linear":
+        decay_steps = max(1, total_steps - warmup_steps)
+        return max(0.0, float(total_steps - current_step) / float(decay_steps))
+
+      # cosine decay
+      progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+      progress = min(max(progress, 0.0), 1.0)
+      return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
+  return optimizer, scheduler
+
+
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
@@ -184,9 +224,10 @@ def train(args):
   model = ParaphraseGPT(args)
   model = model.to(device)
 
-  lr = args.lr
-  optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=0.)
-  best_dev_acc = 0
+  total_training_steps = args.epochs * len(para_train_dataloader)
+  optimizer, scheduler = build_optimizer_and_scheduler(args, model, total_training_steps)
+  best_dev_loss = float('inf')
+  epochs_without_improve = 0
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -209,19 +250,27 @@ def train(args):
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
+      if scheduler is not None:
+        scheduler.step()
 
       train_loss += loss.item()
       num_batches += 1
 
     train_loss = train_loss / num_batches
 
-    dev_acc, dev_f1, *_ = model_eval_paraphrase_local(para_dev_dataloader, model, device)
+    dev_acc, dev_f1, *_, dev_loss = model_eval_paraphrase_local(para_dev_dataloader, model, device)
 
-    if dev_acc > best_dev_acc:
-      best_dev_acc = dev_acc
+    if dev_loss < best_dev_loss:
+      best_dev_loss = dev_loss
+      epochs_without_improve = 0
       save_model(model, optimizer, args, args.filepath)
+    else:
+      epochs_without_improve += 1
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, val loss :: {dev_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    if args.early_stop_patience > 0 and epochs_without_improve >= args.early_stop_patience:
+      print(f"Early stopping at epoch {epoch}: no val-loss improvement for {args.early_stop_patience} epoch(s).")
+      break
 
 
 @torch.no_grad()
@@ -247,7 +296,7 @@ def test(args):
   para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
                                     collate_fn=para_test_data.collate_fn)
 
-  dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase_local(para_dev_dataloader, model, device)
+  dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids, _ = model_eval_paraphrase_local(para_dev_dataloader, model, device)
   print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
   test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
 
@@ -281,6 +330,15 @@ def get_args():
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay used by AdamW.")
+  parser.add_argument("--optimizer_type", type=str, choices=["custom", "torch"], default="custom",
+                      help="AdamW implementation to use.")
+  parser.add_argument("--use_scheduler", action='store_true',
+                      help="Enable LR scheduler with warmup.")
+  parser.add_argument("--scheduler_type", type=str, choices=["linear", "cosine"], default="linear",
+                      help="Scheduler decay shape after warmup.")
+  parser.add_argument("--warmup_steps", type=int, default=0,
+                      help="Number of optimizer steps for linear warmup.")
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
@@ -292,6 +350,8 @@ def get_args():
                       help="Which attention projections to apply LoRA to.")
   parser.add_argument("--use_flash_attention", action='store_true',
                       help="Use PyTorch scaled_dot_product_attention (FlashAttention-backed when supported) in LoRA GPT-2.")
+  parser.add_argument("--early_stop_patience", type=int, default=3,
+                      help="Stop training after this many epochs without val-loss improvement. Set <=0 to disable.")
 
   args = parser.parse_args()
   return args
