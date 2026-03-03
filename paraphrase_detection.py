@@ -12,9 +12,14 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 '''
 
 import argparse
+import copy
+import csv
+import json
+import os
 import random
 import torch
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score
@@ -177,10 +182,13 @@ def save_model(model, optimizer, args, filepath):
 
 def build_optimizer_and_scheduler(args, model, total_training_steps):
   params = filter(lambda p: p.requires_grad, model.parameters())
-  if args.optimizer_type == "torch":
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+  if args.optim_algorithm == "adam":
+    optimizer = torch.optim.Adam(params, lr=args.lr)
   else:
-    optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer_type == "torch":
+      optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+      optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
   scheduler = None
   if args.use_scheduler:
@@ -217,6 +225,12 @@ def maybe_subsample(data, subset_size, seed, name):
   return sampled
 
 
+def count_parameters(model):
+  total = sum(p.numel() for p in model.parameters())
+  trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  return total, trainable
+
+
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
@@ -237,11 +251,15 @@ def train(args):
   args = add_arguments(args)
   model = ParaphraseGPT(args)
   model = model.to(device)
+  total_params, trainable_params = count_parameters(model)
+  print(f"Model params: total={total_params:,}, trainable={trainable_params:,}")
 
   total_training_steps = args.epochs * len(para_train_dataloader)
   optimizer, scheduler = build_optimizer_and_scheduler(args, model, total_training_steps)
   best_dev_loss = float('inf')
   epochs_without_improve = 0
+  best_epoch = -1
+  history = []
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -277,14 +295,33 @@ def train(args):
     if dev_loss < best_dev_loss:
       best_dev_loss = dev_loss
       epochs_without_improve = 0
+      best_epoch = epoch
       save_model(model, optimizer, args, args.filepath)
     else:
       epochs_without_improve += 1
+
+    current_lr = optimizer.param_groups[0]["lr"]
+    history.append({
+      "epoch": epoch,
+      "train_loss": float(train_loss),
+      "dev_loss": float(dev_loss),
+      "dev_acc": float(dev_acc),
+      "dev_f1": float(dev_f1),
+      "lr": float(current_lr),
+    })
 
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, val loss :: {dev_loss :.3f}, dev acc :: {dev_acc :.3f}")
     if args.early_stop_patience > 0 and epochs_without_improve >= args.early_stop_patience:
       print(f"Early stopping at epoch {epoch}: no val-loss improvement for {args.early_stop_patience} epoch(s).")
       break
+
+  return {
+    "history": history,
+    "best_dev_loss": float(best_dev_loss),
+    "best_epoch": best_epoch,
+    "total_params": int(total_params),
+    "trainable_params": int(trainable_params),
+  }
 
 
 @torch.no_grad()
@@ -301,6 +338,8 @@ def test(args):
 
   para_dev_data = load_paraphrase_data(args.para_dev)
   para_test_data = load_paraphrase_data(args.para_test, split='test')
+  para_dev_data = maybe_subsample(para_dev_data, args.dev_subset_size, args.seed + 1, "dev(eval)")
+  para_test_data = maybe_subsample(para_test_data, args.test_subset_size, args.seed + 2, "test(eval)")
 
   para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
   para_test_data = ParaphraseDetectionTestDataset(para_test_data, args)
@@ -328,6 +367,209 @@ def test(args):
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
       f.write(f"{p}, {class_to_token_id(s)} \n")
 
+  return {
+    "dev_acc": float(dev_para_acc),
+    "num_dev_predictions": len(dev_para_y_pred),
+    "num_test_predictions": len(test_para_y_pred),
+    "dev_out_path": args.para_dev_out,
+    "test_out_path": args.para_test_out,
+  }
+
+
+def apply_experiment_defaults(args):
+  if args.train_subset_size <= 0:
+    args.train_subset_size = 2000
+  if args.dev_subset_size <= 0:
+    args.dev_subset_size = 800
+  if args.test_subset_size <= 0:
+    args.test_subset_size = 800
+  if args.epochs > 5:
+    args.epochs = 5
+  return args
+
+
+def format_run_name(config):
+  model_label = "lora" if config["use_lora"] else "full"
+  opt_label = f'{config["optim_algorithm"]}-cosine' if config["use_scheduler"] else config["optim_algorithm"]
+  return f"{model_label}-{opt_label}"
+
+
+def write_experiment_csv(rows, csv_path):
+  if not rows:
+    return
+  fields = list(rows[0].keys())
+  with open(csv_path, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def write_history_csv(rows, csv_path):
+  if not rows:
+    return
+  fields = list(rows[0].keys())
+  with open(csv_path, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def plot_loss_curves(history_rows, out_path):
+  plt.figure(figsize=(12, 5))
+  ax1 = plt.subplot(1, 2, 1)
+  ax2 = plt.subplot(1, 2, 2)
+
+  run_names = sorted({row["run_name"] for row in history_rows})
+  for run_name in run_names:
+    rows = [r for r in history_rows if r["run_name"] == run_name]
+    rows = sorted(rows, key=lambda r: r["epoch"])
+    epochs = [r["epoch"] for r in rows]
+    train_losses = [r["train_loss"] for r in rows]
+    dev_losses = [r["dev_loss"] for r in rows]
+    ax1.plot(epochs, train_losses, marker="o", label=run_name)
+    ax2.plot(epochs, dev_losses, marker="o", label=run_name)
+
+  ax1.set_title("Train Loss")
+  ax1.set_xlabel("Epoch")
+  ax1.set_ylabel("Loss")
+  ax1.grid(True, alpha=0.3)
+
+  ax2.set_title("Dev Loss")
+  ax2.set_xlabel("Epoch")
+  ax2.set_ylabel("Loss")
+  ax2.grid(True, alpha=0.3)
+  ax2.legend(loc="best", fontsize=8)
+
+  plt.tight_layout()
+  plt.savefig(out_path, dpi=220)
+  plt.close()
+
+
+def plot_performance_bars(summary_rows, out_path):
+  names = [r["run_name"] for r in summary_rows]
+  x = np.arange(len(names))
+  width = 0.36
+  dev_acc = [r["dev_acc"] for r in summary_rows]
+  best_dev_f1 = [r["best_dev_f1"] for r in summary_rows]
+
+  plt.figure(figsize=(11, 5))
+  plt.bar(x - width / 2, dev_acc, width, label="Dev Accuracy")
+  plt.bar(x + width / 2, best_dev_f1, width, label="Best Dev F1")
+  plt.xticks(x, names, rotation=20)
+  plt.ylim(0.0, 1.0)
+  plt.ylabel("Score")
+  plt.title("Paraphrase Performance Comparison")
+  plt.grid(axis="y", alpha=0.3)
+  plt.legend()
+  plt.tight_layout()
+  plt.savefig(out_path, dpi=220)
+  plt.close()
+
+
+def plot_parameter_efficiency(summary_rows, out_path):
+  plt.figure(figsize=(7.5, 5))
+  for row in summary_rows:
+    marker = "o" if row["use_lora"] else "s"
+    plt.scatter(row["trainable_params"], row["best_dev_f1"], s=80, marker=marker, label=row["run_name"])
+    plt.annotate(row["run_name"], (row["trainable_params"], row["best_dev_f1"]), fontsize=8)
+
+  plt.xscale("log")
+  plt.xlabel("Trainable Parameters (log scale)")
+  plt.ylabel("Best Dev F1")
+  plt.title("Parameter Efficiency vs Performance")
+  plt.grid(True, alpha=0.3)
+  plt.tight_layout()
+  plt.savefig(out_path, dpi=220)
+  plt.close()
+
+
+def run_experiments(args):
+  args = apply_experiment_defaults(args)
+  os.makedirs(args.experiment_dir, exist_ok=True)
+  pred_dir = os.path.join(args.experiment_dir, "predictions")
+  os.makedirs(pred_dir, exist_ok=True)
+
+  experiment_configs = [
+    {"use_lora": False, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
+    {"use_lora": False, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
+    {"use_lora": True, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
+    {"use_lora": True, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
+  ]
+
+  summary_rows = []
+  history_rows = []
+  for idx, config in enumerate(experiment_configs):
+    run_args = copy.deepcopy(args)
+    run_args.use_lora = config["use_lora"]
+    run_args.optim_algorithm = config["optim_algorithm"]
+    run_args.use_scheduler = config["use_scheduler"]
+    run_args.scheduler_type = config["scheduler_type"]
+    run_name = format_run_name(config)
+
+    run_args.filepath = os.path.join(args.experiment_dir, f"run_{idx + 1}_{run_name}.pt")
+    run_args.para_dev_out = os.path.join(pred_dir, f"run_{idx + 1}_{run_name}_dev.csv")
+    run_args.para_test_out = os.path.join(pred_dir, f"run_{idx + 1}_{run_name}_test.csv")
+
+    seed_everything(run_args.seed)
+    print("\n" + "=" * 80)
+    print(f"Running experiment {idx + 1}/4: {run_name}")
+    print("=" * 80)
+    train_info = train(run_args)
+    eval_info = test(run_args)
+
+    best_dev_f1 = max([r["dev_f1"] for r in train_info["history"]]) if train_info["history"] else 0.0
+    summary_rows.append({
+      "run_id": idx + 1,
+      "run_name": run_name,
+      "use_lora": bool(config["use_lora"]),
+      "optim_algorithm": config["optim_algorithm"],
+      "use_scheduler": bool(config["use_scheduler"]),
+      "scheduler_type": config["scheduler_type"],
+      "train_subset_size": run_args.train_subset_size,
+      "dev_subset_size": run_args.dev_subset_size,
+      "test_subset_size": run_args.test_subset_size,
+      "epochs": run_args.epochs,
+      "lr": run_args.lr,
+      "weight_decay": run_args.weight_decay,
+      "warmup_steps": run_args.warmup_steps,
+      "best_dev_loss": train_info["best_dev_loss"],
+      "best_epoch": train_info["best_epoch"],
+      "best_dev_f1": float(best_dev_f1),
+      "dev_acc": eval_info["dev_acc"],
+      "total_params": train_info["total_params"],
+      "trainable_params": train_info["trainable_params"],
+      "checkpoint_path": run_args.filepath,
+      "dev_out_path": eval_info["dev_out_path"],
+      "test_out_path": eval_info["test_out_path"],
+    })
+
+    for epoch_row in train_info["history"]:
+      history_rows.append({
+        "run_id": idx + 1,
+        "run_name": run_name,
+        **epoch_row,
+      })
+
+  summary_csv = os.path.join(args.experiment_dir, "experiment_summary.csv")
+  history_csv = os.path.join(args.experiment_dir, "experiment_history.csv")
+  write_experiment_csv(summary_rows, summary_csv)
+  write_history_csv(history_rows, history_csv)
+  with open(os.path.join(args.experiment_dir, "experiment_summary.json"), "w") as f:
+    json.dump(summary_rows, f, indent=2)
+
+  if history_rows:
+    plot_loss_curves(history_rows, os.path.join(args.experiment_dir, "loss_curves.png"))
+  if summary_rows:
+    plot_performance_bars(summary_rows, os.path.join(args.experiment_dir, "performance_comparison.png"))
+    plot_parameter_efficiency(summary_rows, os.path.join(args.experiment_dir, "parameter_efficiency.png"))
+
+  print("\nExperiment artifacts:")
+  print(f"- {summary_csv}")
+  print(f"- {history_csv}")
+  print(f"- {os.path.join(args.experiment_dir, 'loss_curves.png')}")
+  print(f"- {os.path.join(args.experiment_dir, 'performance_comparison.png')}")
+  print(f"- {os.path.join(args.experiment_dir, 'parameter_efficiency.png')}")
+
 
 def get_args():
   parser = argparse.ArgumentParser()
@@ -349,6 +591,8 @@ def get_args():
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay used by AdamW.")
+  parser.add_argument("--optim_algorithm", type=str, choices=["adam", "adamw"], default="adam",
+                      help="Optimizer family: Adam or AdamW.")
   parser.add_argument("--optimizer_type", type=str, choices=["custom", "torch"], default="custom",
                       help="AdamW implementation to use.")
   parser.add_argument("--use_scheduler", action='store_true',
@@ -370,6 +614,12 @@ def get_args():
                       help="Use PyTorch scaled_dot_product_attention (FlashAttention-backed when supported) in LoRA GPT-2.")
   parser.add_argument("--early_stop_patience", type=int, default=3,
                       help="Stop training after this many epochs without val-loss improvement. Set <=0 to disable.")
+  parser.add_argument("--test_subset_size", type=int, default=0,
+                      help="If >0, evaluate only on this many test examples.")
+  parser.add_argument("--run_experiments", action='store_true',
+                      help="Run the 4-way experiment matrix and generate csv + charts.")
+  parser.add_argument("--experiment_dir", type=str, default="results/paraphrase_experiments",
+                      help="Directory for experiment outputs.")
 
   args = parser.parse_args()
   return args
@@ -398,5 +648,8 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  train(args)
-  test(args)
+  if args.run_experiments:
+    run_experiments(args)
+  else:
+    train(args)
+    test(args)
