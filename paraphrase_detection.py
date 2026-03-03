@@ -14,6 +14,7 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 import argparse
 import copy
 import csv
+import itertools
 import json
 import os
 import random
@@ -388,6 +389,15 @@ def apply_experiment_defaults(args):
   return args
 
 
+def get_base_experiment_configs():
+  return [
+    {"use_lora": False, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
+    {"use_lora": False, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
+    {"use_lora": True, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
+    {"use_lora": True, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
+  ]
+
+
 def format_run_name(config):
   model_label = "lora" if config["use_lora"] else "full"
   opt_label = f'{config["optim_algorithm"]}-cosine' if config["use_scheduler"] else config["optim_algorithm"]
@@ -483,18 +493,36 @@ def plot_parameter_efficiency(summary_rows, out_path):
   plt.close()
 
 
-def run_experiments(args):
-  args = apply_experiment_defaults(args)
-  os.makedirs(args.experiment_dir, exist_ok=True)
-  pred_dir = os.path.join(args.experiment_dir, "predictions")
-  os.makedirs(pred_dir, exist_ok=True)
+def parse_float_list(value):
+  return [float(x.strip()) for x in value.split(",") if x.strip()]
 
-  experiment_configs = [
-    {"use_lora": False, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
-    {"use_lora": False, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
-    {"use_lora": True, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
-    {"use_lora": True, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
-  ]
+
+def parse_int_list(value):
+  return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def build_run_name(config):
+  base = format_run_name(config)
+  suffix_parts = []
+  if "lr" in config:
+    suffix_parts.append(f"lr{config['lr']:.0e}")
+  if config.get("use_lora", False):
+    suffix_parts.append(f"r{int(config.get('lora_r', 0))}")
+    suffix_parts.append(f"a{int(config.get('lora_alpha', 0))}")
+    suffix_parts.append(f"d{config.get('lora_dropout', 0.0):.2f}")
+  if config.get("optim_algorithm") == "adamw":
+    suffix_parts.append(f"wd{config.get('weight_decay', 0.0):.3f}")
+  if config.get("use_scheduler", False):
+    suffix_parts.append(f"wu{int(config.get('warmup_steps', 0))}")
+  if not suffix_parts:
+    return base
+  return f"{base}-{'-'.join(suffix_parts)}"
+
+
+def run_config_set(args, experiment_configs, output_dir, run_prefix="run", generate_plots=True):
+  os.makedirs(output_dir, exist_ok=True)
+  pred_dir = os.path.join(output_dir, "predictions")
+  os.makedirs(pred_dir, exist_ok=True)
 
   summary_rows = []
   history_rows = []
@@ -504,15 +532,28 @@ def run_experiments(args):
     run_args.optim_algorithm = config["optim_algorithm"]
     run_args.use_scheduler = config["use_scheduler"]
     run_args.scheduler_type = config["scheduler_type"]
-    run_name = format_run_name(config)
+    if "lr" in config:
+      run_args.lr = float(config["lr"])
+    if "weight_decay" in config:
+      run_args.weight_decay = float(config["weight_decay"])
+    if "warmup_steps" in config:
+      run_args.warmup_steps = int(config["warmup_steps"])
+    if run_args.use_lora:
+      if "lora_r" in config:
+        run_args.lora_r = int(config["lora_r"])
+      if "lora_alpha" in config:
+        run_args.lora_alpha = float(config["lora_alpha"])
+      if "lora_dropout" in config:
+        run_args.lora_dropout = float(config["lora_dropout"])
+    run_name = config.get("run_name", build_run_name(config))
 
-    run_args.filepath = os.path.join(args.experiment_dir, f"run_{idx + 1}_{run_name}.pt")
-    run_args.para_dev_out = os.path.join(pred_dir, f"run_{idx + 1}_{run_name}_dev.csv")
-    run_args.para_test_out = os.path.join(pred_dir, f"run_{idx + 1}_{run_name}_test.csv")
+    run_args.filepath = os.path.join(output_dir, f"{run_prefix}_{idx + 1}_{run_name}.pt")
+    run_args.para_dev_out = os.path.join(pred_dir, f"{run_prefix}_{idx + 1}_{run_name}_dev.csv")
+    run_args.para_test_out = os.path.join(pred_dir, f"{run_prefix}_{idx + 1}_{run_name}_test.csv")
 
     seed_everything(run_args.seed)
     print("\n" + "=" * 80)
-    print(f"Running experiment {idx + 1}/4: {run_name}")
+    print(f"Running experiment {idx + 1}/{len(experiment_configs)}: {run_name}")
     print("=" * 80)
     train_info = train(run_args)
     eval_info = test(run_args)
@@ -532,6 +573,9 @@ def run_experiments(args):
       "lr": run_args.lr,
       "weight_decay": run_args.weight_decay,
       "warmup_steps": run_args.warmup_steps,
+      "lora_r": run_args.lora_r if run_args.use_lora else "",
+      "lora_alpha": run_args.lora_alpha if run_args.use_lora else "",
+      "lora_dropout": run_args.lora_dropout if run_args.use_lora else "",
       "best_dev_loss": train_info["best_dev_loss"],
       "best_epoch": train_info["best_epoch"],
       "best_dev_f1": float(best_dev_f1),
@@ -550,25 +594,175 @@ def run_experiments(args):
         **epoch_row,
       })
 
-  summary_csv = os.path.join(args.experiment_dir, "experiment_summary.csv")
-  history_csv = os.path.join(args.experiment_dir, "experiment_history.csv")
+  summary_csv = os.path.join(output_dir, "experiment_summary.csv")
+  history_csv = os.path.join(output_dir, "experiment_history.csv")
   write_experiment_csv(summary_rows, summary_csv)
   write_history_csv(history_rows, history_csv)
-  with open(os.path.join(args.experiment_dir, "experiment_summary.json"), "w") as f:
+  with open(os.path.join(output_dir, "experiment_summary.json"), "w") as f:
     json.dump(summary_rows, f, indent=2)
 
-  if history_rows:
-    plot_loss_curves(history_rows, os.path.join(args.experiment_dir, "loss_curves.png"))
-  if summary_rows:
-    plot_performance_bars(summary_rows, os.path.join(args.experiment_dir, "performance_comparison.png"))
-    plot_parameter_efficiency(summary_rows, os.path.join(args.experiment_dir, "parameter_efficiency.png"))
+  if generate_plots and history_rows:
+    plot_loss_curves(history_rows, os.path.join(output_dir, "loss_curves.png"))
+  if generate_plots and summary_rows:
+    plot_performance_bars(summary_rows, os.path.join(output_dir, "performance_comparison.png"))
+    plot_parameter_efficiency(summary_rows, os.path.join(output_dir, "parameter_efficiency.png"))
 
   print("\nExperiment artifacts:")
   print(f"- {summary_csv}")
   print(f"- {history_csv}")
-  print(f"- {os.path.join(args.experiment_dir, 'loss_curves.png')}")
-  print(f"- {os.path.join(args.experiment_dir, 'performance_comparison.png')}")
-  print(f"- {os.path.join(args.experiment_dir, 'parameter_efficiency.png')}")
+  if generate_plots:
+    print(f"- {os.path.join(output_dir, 'loss_curves.png')}")
+    print(f"- {os.path.join(output_dir, 'performance_comparison.png')}")
+    print(f"- {os.path.join(output_dir, 'parameter_efficiency.png')}")
+
+  return summary_rows, history_rows
+
+
+def build_tuning_candidates(args, base_config, method_index):
+  lr_values = parse_float_list(args.tune_lora_lrs) if base_config["use_lora"] else parse_float_list(args.tune_full_lrs)
+  if base_config["use_lora"]:
+    lora_r_values = parse_int_list(args.tune_lora_rs)
+    lora_alpha_values = parse_float_list(args.tune_lora_alphas)
+    lora_dropout_values = parse_float_list(args.tune_lora_dropouts)
+  else:
+    lora_r_values = [args.lora_r]
+    lora_alpha_values = [args.lora_alpha]
+    lora_dropout_values = [args.lora_dropout]
+
+  if base_config["optim_algorithm"] == "adamw":
+    weight_decay_values = parse_float_list(args.tune_weight_decays)
+  else:
+    weight_decay_values = [args.weight_decay]
+
+  if base_config["use_scheduler"]:
+    warmup_values = parse_int_list(args.tune_warmup_steps)
+  else:
+    warmup_values = [args.warmup_steps]
+
+  candidates = []
+  for lr, wd, wu, lora_r, lora_alpha, lora_dropout in itertools.product(
+      lr_values, weight_decay_values, warmup_values, lora_r_values, lora_alpha_values, lora_dropout_values):
+    candidate = {
+      **base_config,
+      "lr": lr,
+      "weight_decay": wd,
+      "warmup_steps": wu,
+      "lora_r": lora_r,
+      "lora_alpha": lora_alpha,
+      "lora_dropout": lora_dropout,
+    }
+    candidates.append(candidate)
+
+  max_trials = max(args.max_tuning_trials_per_approach, 1)
+  if len(candidates) > max_trials:
+    rng = random.Random(args.seed + 1000 + method_index)
+    candidates = rng.sample(candidates, max_trials)
+
+  for i, candidate in enumerate(candidates):
+    candidate["run_name"] = f"{format_run_name(base_config)}-trial{i + 1}"
+  return candidates
+
+
+def pick_best_row(rows, metric):
+  if metric == "dev_acc":
+    key_fn = lambda r: (r["dev_acc"], -r["best_dev_loss"])
+  else:
+    key_fn = lambda r: (r["best_dev_f1"], -r["best_dev_loss"])
+  return max(rows, key=key_fn)
+
+
+def run_tuned_then_compare(args):
+  args = apply_experiment_defaults(args)
+  os.makedirs(args.experiment_dir, exist_ok=True)
+  base_configs = get_base_experiment_configs()
+
+  tuning_args = copy.deepcopy(args)
+  if args.tuning_epochs > 0:
+    tuning_args.epochs = args.tuning_epochs
+
+  tuning_root = os.path.join(args.experiment_dir, "phase1_tuning")
+  os.makedirs(tuning_root, exist_ok=True)
+  tuning_trial_rows = []
+  best_config_map = {}
+
+  for method_idx, base_config in enumerate(base_configs):
+    method_name = format_run_name(base_config)
+    method_dir = os.path.join(tuning_root, f"method_{method_idx + 1}_{method_name}")
+    candidates = build_tuning_candidates(tuning_args, base_config, method_idx)
+    print(f"\nTuning {method_name}: {len(candidates)} trial(s)")
+    trial_summary_rows, _ = run_config_set(
+      tuning_args, candidates, method_dir, run_prefix="trial", generate_plots=False
+    )
+    for row in trial_summary_rows:
+      row["phase"] = "tuning"
+      row["method_name"] = method_name
+      tuning_trial_rows.append(row)
+
+    best_row = pick_best_row(trial_summary_rows, args.tuning_metric)
+    best_config_map[method_name] = {
+      "lr": best_row["lr"],
+      "weight_decay": best_row["weight_decay"],
+      "warmup_steps": best_row["warmup_steps"],
+      "lora_r": args.lora_r if not base_config["use_lora"] else best_row.get("lora_r", args.lora_r),
+      "lora_alpha": args.lora_alpha if not base_config["use_lora"] else best_row.get("lora_alpha", args.lora_alpha),
+      "lora_dropout": args.lora_dropout if not base_config["use_lora"] else best_row.get("lora_dropout", args.lora_dropout),
+      "selected_metric": best_row[args.tuning_metric],
+      "best_dev_f1": best_row["best_dev_f1"],
+      "dev_acc": best_row["dev_acc"],
+      "best_dev_loss": best_row["best_dev_loss"],
+      "run_name": best_row["run_name"],
+    }
+
+  write_experiment_csv(tuning_trial_rows, os.path.join(tuning_root, "all_tuning_trials.csv"))
+  with open(os.path.join(tuning_root, "best_configs.json"), "w") as f:
+    json.dump(best_config_map, f, indent=2)
+
+  compare_args = copy.deepcopy(args)
+  if args.comparison_epochs > 0:
+    compare_args.epochs = args.comparison_epochs
+
+  controlled_dir = os.path.join(args.experiment_dir, "phase2_controlled_shared")
+  controlled_summary, _ = run_config_set(
+    compare_args, base_configs, controlled_dir, run_prefix="controlled", generate_plots=True
+  )
+  for row in controlled_summary:
+    row["phase"] = "controlled_shared"
+
+  tuned_best_configs = []
+  for base in base_configs:
+    method_name = format_run_name(base)
+    best_hp = best_config_map[method_name]
+    tuned_best_configs.append({
+      **base,
+      "lr": best_hp["lr"],
+      "weight_decay": best_hp["weight_decay"],
+      "warmup_steps": best_hp["warmup_steps"],
+      "lora_r": best_hp["lora_r"],
+      "lora_alpha": best_hp["lora_alpha"],
+      "lora_dropout": best_hp["lora_dropout"],
+      "run_name": f"{method_name}-tuned",
+    })
+
+  tuned_dir = os.path.join(args.experiment_dir, "phase3_tuned_best")
+  tuned_summary, _ = run_config_set(
+    compare_args, tuned_best_configs, tuned_dir, run_prefix="tuned", generate_plots=True
+  )
+  for row in tuned_summary:
+    row["phase"] = "tuned_best"
+
+  final_rows = controlled_summary + tuned_summary
+  write_experiment_csv(final_rows, os.path.join(args.experiment_dir, "final_comparison_summary.csv"))
+  print("\nTwo-phase experiment complete.")
+  print(f"- Tuning artifacts: {tuning_root}")
+  print(f"- Controlled comparison: {controlled_dir}")
+  print(f"- Tuned-best comparison: {tuned_dir}")
+  print(f"- Final summary: {os.path.join(args.experiment_dir, 'final_comparison_summary.csv')}")
+
+
+def run_experiments(args):
+  args = apply_experiment_defaults(args)
+  base_configs = get_base_experiment_configs()
+  run_config_set(args, base_configs, args.experiment_dir, run_prefix="run", generate_plots=True)
 
 
 def get_args():
@@ -618,8 +812,32 @@ def get_args():
                       help="If >0, evaluate only on this many test examples.")
   parser.add_argument("--run_experiments", action='store_true',
                       help="Run the 4-way experiment matrix and generate csv + charts.")
+  parser.add_argument("--run_tuned_then_compare", action='store_true',
+                      help="Phase 1: tune each method. Phase 2: controlled and tuned-best 4-way comparisons.")
   parser.add_argument("--experiment_dir", type=str, default="results/paraphrase_experiments",
                       help="Directory for experiment outputs.")
+  parser.add_argument("--tuning_metric", type=str, choices=["best_dev_f1", "dev_acc"], default="best_dev_f1",
+                      help="Metric used to select best hyperparameters per method.")
+  parser.add_argument("--max_tuning_trials_per_approach", type=int, default=8,
+                      help="Cap number of sampled hyperparameter trials per approach.")
+  parser.add_argument("--tuning_epochs", type=int, default=0,
+                      help="If >0, override epochs during phase-1 tuning.")
+  parser.add_argument("--comparison_epochs", type=int, default=0,
+                      help="If >0, override epochs for phase-2/3 comparisons.")
+  parser.add_argument("--tune_full_lrs", type=str, default="1e-5,2e-5,3e-5",
+                      help="Comma-separated LR list for full fine-tuning.")
+  parser.add_argument("--tune_lora_lrs", type=str, default="5e-5,1e-4,2e-4",
+                      help="Comma-separated LR list for LoRA fine-tuning.")
+  parser.add_argument("--tune_weight_decays", type=str, default="0.0,0.01",
+                      help="Comma-separated weight decay list for AdamW methods.")
+  parser.add_argument("--tune_warmup_steps", type=str, default="0,20,50",
+                      help="Comma-separated warmup steps list for scheduled methods.")
+  parser.add_argument("--tune_lora_rs", type=str, default="8,16",
+                      help="Comma-separated LoRA rank list.")
+  parser.add_argument("--tune_lora_alphas", type=str, default="16,32",
+                      help="Comma-separated LoRA alpha list.")
+  parser.add_argument("--tune_lora_dropouts", type=str, default="0.0,0.1",
+                      help="Comma-separated LoRA dropout list.")
 
   args = parser.parse_args()
   return args
@@ -648,7 +866,9 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  if args.run_experiments:
+  if args.run_tuned_then_compare:
+    run_tuned_then_compare(args)
+  elif args.run_experiments:
     run_experiments(args)
   else:
     train(args)
