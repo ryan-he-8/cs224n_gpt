@@ -1,0 +1,54 @@
+{
+  "full-adam": {
+    "lr": 3e-05,
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "selected_metric": 0.7611940298507462,
+    "best_dev_f1": 0.7611940298507462,
+    "dev_acc": 0.7675,
+    "best_dev_loss": 0.472646114975214,
+    "run_name": "full-adam-trial3"
+  },
+  "full-adamw-cosine": {
+    "lr": 3e-05,
+    "weight_decay": 0.01,
+    "warmup_steps": 50,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "selected_metric": 0.7650537743300996,
+    "best_dev_f1": 0.7650537743300996,
+    "dev_acc": 0.7825,
+    "best_dev_loss": 0.4766284957528114,
+    "run_name": "full-adamw-cosine-trial3"
+  },
+  "lora-adam": {
+    "lr": 0.0002,
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.0,
+    "selected_metric": 0.6280867699921664,
+    "best_dev_f1": 0.6280867699921664,
+    "dev_acc": 0.6825,
+    "best_dev_loss": 0.5952862298488617,
+    "run_name": "lora-adam-trial3"
+  },
+  "lora-adamw-cosine": {
+    "lr": 0.0002,
+    "weight_decay": 0.0,
+    "warmup_steps": 50,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.1,
+    "selected_metric": 0.38271604938271603,
+    "best_dev_f1": 0.38271604938271603,
+    "dev_acc": 0.62,
+    "best_dev_loss": 0.6454119157791137,
+    "run_name": "lora-adamw-cosine-trial4"
+  }
+}
