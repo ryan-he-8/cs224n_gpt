@@ -424,6 +424,43 @@ def write_history_csv(rows, csv_path):
     writer.writerows(rows)
 
 
+def read_prediction_distribution(csv_path):
+  yes_count = 0
+  no_count = 0
+  if not os.path.exists(csv_path):
+    return {
+      "dev_yes_count": 0,
+      "dev_no_count": 0,
+      "dev_yes_rate": 0.0,
+      "dev_no_rate": 0.0,
+      "dev_is_collapsed": True,
+    }
+
+  with open(csv_path, "r") as f:
+    next(f, None)
+    for line in f:
+      parts = line.strip().split(",")
+      if len(parts) < 2:
+        continue
+      pred = parts[1].strip()
+      if pred == str(YES_TOKEN_ID):
+        yes_count += 1
+      elif pred == str(NO_TOKEN_ID):
+        no_count += 1
+
+  total = yes_count + no_count
+  yes_rate = float(yes_count) / float(total) if total > 0 else 0.0
+  no_rate = float(no_count) / float(total) if total > 0 else 0.0
+  collapsed = (yes_rate < 0.05) or (yes_rate > 0.95)
+  return {
+    "dev_yes_count": yes_count,
+    "dev_no_count": no_count,
+    "dev_yes_rate": yes_rate,
+    "dev_no_rate": no_rate,
+    "dev_is_collapsed": collapsed,
+  }
+
+
 def plot_loss_curves(history_rows, out_path):
   plt.figure(figsize=(12, 5))
   ax1 = plt.subplot(1, 2, 1)
@@ -545,7 +582,20 @@ def run_config_set(args, experiment_configs, output_dir, run_prefix="run", gener
         run_args.lora_alpha = float(config["lora_alpha"])
       if "lora_dropout" in config:
         run_args.lora_dropout = float(config["lora_dropout"])
-    run_name = config.get("run_name", build_run_name(config))
+    if "run_name" in config:
+      run_name = config["run_name"]
+    else:
+      effective_config = {
+        **config,
+        "lr": run_args.lr,
+        "weight_decay": run_args.weight_decay,
+        "warmup_steps": run_args.warmup_steps,
+      }
+      if run_args.use_lora:
+        effective_config["lora_r"] = run_args.lora_r
+        effective_config["lora_alpha"] = run_args.lora_alpha
+        effective_config["lora_dropout"] = run_args.lora_dropout
+      run_name = build_run_name(effective_config)
 
     run_args.filepath = os.path.join(output_dir, f"{run_prefix}_{idx + 1}_{run_name}.pt")
     run_args.para_dev_out = os.path.join(pred_dir, f"{run_prefix}_{idx + 1}_{run_name}_dev.csv")
@@ -557,8 +607,11 @@ def run_config_set(args, experiment_configs, output_dir, run_prefix="run", gener
     print("=" * 80)
     train_info = train(run_args)
     eval_info = test(run_args)
+    pred_stats = read_prediction_distribution(eval_info["dev_out_path"])
 
     best_dev_f1 = max([r["dev_f1"] for r in train_info["history"]]) if train_info["history"] else 0.0
+    final_dev_f1 = train_info["history"][-1]["dev_f1"] if train_info["history"] else 0.0
+    f1_gain = float(best_dev_f1) - float(train_info["history"][0]["dev_f1"]) if train_info["history"] else 0.0
     summary_rows.append({
       "run_id": idx + 1,
       "run_name": run_name,
@@ -579,7 +632,14 @@ def run_config_set(args, experiment_configs, output_dir, run_prefix="run", gener
       "best_dev_loss": train_info["best_dev_loss"],
       "best_epoch": train_info["best_epoch"],
       "best_dev_f1": float(best_dev_f1),
+      "final_dev_f1": float(final_dev_f1),
+      "dev_f1_gain": float(f1_gain),
       "dev_acc": eval_info["dev_acc"],
+      "dev_yes_rate": pred_stats["dev_yes_rate"],
+      "dev_no_rate": pred_stats["dev_no_rate"],
+      "dev_yes_count": pred_stats["dev_yes_count"],
+      "dev_no_count": pred_stats["dev_no_count"],
+      "dev_is_collapsed": pred_stats["dev_is_collapsed"],
       "total_params": train_info["total_params"],
       "trainable_params": train_info["trainable_params"],
       "checkpoint_path": run_args.filepath,
@@ -618,6 +678,14 @@ def run_config_set(args, experiment_configs, output_dir, run_prefix="run", gener
   return summary_rows, history_rows
 
 
+def sample_candidates(candidates, max_trials, seed):
+  max_trials = max(max_trials, 1)
+  if len(candidates) <= max_trials:
+    return candidates
+  rng = random.Random(seed)
+  return rng.sample(candidates, max_trials)
+
+
 def build_tuning_candidates(args, base_config, method_index):
   lr_values = parse_float_list(args.tune_lora_lrs) if base_config["use_lora"] else parse_float_list(args.tune_full_lrs)
   if base_config["use_lora"]:
@@ -653,22 +721,21 @@ def build_tuning_candidates(args, base_config, method_index):
     }
     candidates.append(candidate)
 
-  max_trials = max(args.max_tuning_trials_per_approach, 1)
-  if len(candidates) > max_trials:
-    rng = random.Random(args.seed + 1000 + method_index)
-    candidates = rng.sample(candidates, max_trials)
+  candidates = sample_candidates(candidates, args.max_tuning_trials_per_approach, args.seed + 1000 + method_index)
 
   for i, candidate in enumerate(candidates):
     candidate["run_name"] = f"{format_run_name(base_config)}-trial{i + 1}"
   return candidates
 
 
-def pick_best_row(rows, metric):
+def pick_best_row(rows, metric, min_yes_rate=0.0, max_yes_rate=1.0):
+  filtered = [r for r in rows if min_yes_rate <= float(r.get("dev_yes_rate", 0.0)) <= max_yes_rate]
+  pool = filtered if filtered else rows
   if metric == "dev_acc":
     key_fn = lambda r: (r["dev_acc"], -r["best_dev_loss"])
   else:
     key_fn = lambda r: (r["best_dev_f1"], -r["best_dev_loss"])
-  return max(rows, key=key_fn)
+  return max(pool, key=key_fn)
 
 
 def run_tuned_then_compare(args):
@@ -698,7 +765,9 @@ def run_tuned_then_compare(args):
       row["method_name"] = method_name
       tuning_trial_rows.append(row)
 
-    best_row = pick_best_row(trial_summary_rows, args.tuning_metric)
+    min_yes = args.selection_min_yes_rate if args.enforce_prediction_balance else 0.0
+    max_yes = args.selection_max_yes_rate if args.enforce_prediction_balance else 1.0
+    best_row = pick_best_row(trial_summary_rows, args.tuning_metric, min_yes_rate=min_yes, max_yes_rate=max_yes)
     best_config_map[method_name] = {
       "lr": best_row["lr"],
       "weight_decay": best_row["weight_decay"],
@@ -709,6 +778,7 @@ def run_tuned_then_compare(args):
       "selected_metric": best_row[args.tuning_metric],
       "best_dev_f1": best_row["best_dev_f1"],
       "dev_acc": best_row["dev_acc"],
+      "dev_yes_rate": best_row.get("dev_yes_rate", 0.0),
       "best_dev_loss": best_row["best_dev_loss"],
       "run_name": best_row["run_name"],
     }
@@ -757,6 +827,60 @@ def run_tuned_then_compare(args):
   print(f"- Controlled comparison: {controlled_dir}")
   print(f"- Tuned-best comparison: {tuned_dir}")
   print(f"- Final summary: {os.path.join(args.experiment_dir, 'final_comparison_summary.csv')}")
+
+
+def build_lora_adamw_focus_candidates(args):
+  base = {"use_lora": True, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"}
+  lr_values = parse_float_list(args.focus_lora_adamw_lrs)
+  wd_values = parse_float_list(args.focus_lora_adamw_weight_decays)
+  warmup_values = parse_int_list(args.focus_lora_adamw_warmup_steps)
+  lora_r_values = parse_int_list(args.focus_lora_adamw_rs)
+  lora_alpha_values = parse_float_list(args.focus_lora_adamw_alphas)
+  lora_dropout_values = parse_float_list(args.focus_lora_adamw_dropouts)
+
+  candidates = []
+  for lr, wd, wu, lora_r, lora_alpha, lora_dropout in itertools.product(
+      lr_values, wd_values, warmup_values, lora_r_values, lora_alpha_values, lora_dropout_values):
+    candidates.append({
+      **base,
+      "lr": lr,
+      "weight_decay": wd,
+      "warmup_steps": wu,
+      "lora_r": lora_r,
+      "lora_alpha": lora_alpha,
+      "lora_dropout": lora_dropout,
+    })
+  candidates = sample_candidates(candidates, args.focus_lora_adamw_max_trials, args.seed + 2048)
+  for i, candidate in enumerate(candidates):
+    candidate["run_name"] = f"lora-adamw-cosine-focus-trial{i + 1}"
+  return candidates
+
+
+def run_lora_adamw_focus_checks(args):
+  args = apply_experiment_defaults(args)
+  focus_args = copy.deepcopy(args)
+  if args.focus_lora_adamw_epochs > 0:
+    focus_args.epochs = args.focus_lora_adamw_epochs
+
+  output_dir = os.path.join(args.experiment_dir, "lora_adamw_focus_checks")
+  candidates = build_lora_adamw_focus_candidates(focus_args)
+  print(f"\nRunning LoRA+AdamW+cosine focus checks: {len(candidates)} trial(s)")
+  summary_rows, _ = run_config_set(focus_args, candidates, output_dir, run_prefix="focus", generate_plots=True)
+
+  min_yes = args.selection_min_yes_rate if args.enforce_prediction_balance else 0.0
+  max_yes = args.selection_max_yes_rate if args.enforce_prediction_balance else 1.0
+  best_row = pick_best_row(summary_rows, args.tuning_metric, min_yes_rate=min_yes, max_yes_rate=max_yes)
+
+  ranked_rows = sorted(summary_rows, key=lambda r: (r["best_dev_f1"], -r["best_dev_loss"]), reverse=True)
+  write_experiment_csv(ranked_rows, os.path.join(output_dir, "ranked_trials.csv"))
+  with open(os.path.join(output_dir, "best_trial.json"), "w") as f:
+    json.dump(best_row, f, indent=2)
+
+  print("\nFocus check artifacts:")
+  print(f"- {os.path.join(output_dir, 'ranked_trials.csv')}")
+  print(f"- {os.path.join(output_dir, 'best_trial.json')}")
+  print(f"- best trial: {best_row['run_name']} | best_dev_f1={best_row['best_dev_f1']:.4f} | "
+        f"dev_yes_rate={best_row.get('dev_yes_rate', 0.0):.3f}")
 
 
 def run_experiments(args):
@@ -814,6 +938,8 @@ def get_args():
                       help="Run the 4-way experiment matrix and generate csv + charts.")
   parser.add_argument("--run_tuned_then_compare", action='store_true',
                       help="Phase 1: tune each method. Phase 2: controlled and tuned-best 4-way comparisons.")
+  parser.add_argument("--run_lora_adamw_focus_checks", action='store_true',
+                      help="Focused hyperparameter sweep and diagnostics for LoRA+AdamW+cosine.")
   parser.add_argument("--experiment_dir", type=str, default="results/paraphrase_experiments",
                       help="Directory for experiment outputs.")
   parser.add_argument("--tuning_metric", type=str, choices=["best_dev_f1", "dev_acc"], default="best_dev_f1",
@@ -838,6 +964,28 @@ def get_args():
                       help="Comma-separated LoRA alpha list.")
   parser.add_argument("--tune_lora_dropouts", type=str, default="0.0,0.1",
                       help="Comma-separated LoRA dropout list.")
+  parser.add_argument("--enforce_prediction_balance", action='store_true',
+                      help="When selecting best trial, prefer runs with dev yes-rate inside configured bounds.")
+  parser.add_argument("--selection_min_yes_rate", type=float, default=0.05,
+                      help="Lower bound on dev yes-rate for balanced trial selection.")
+  parser.add_argument("--selection_max_yes_rate", type=float, default=0.95,
+                      help="Upper bound on dev yes-rate for balanced trial selection.")
+  parser.add_argument("--focus_lora_adamw_epochs", type=int, default=8,
+                      help="Epochs for LoRA+AdamW+cosine focus checks.")
+  parser.add_argument("--focus_lora_adamw_max_trials", type=int, default=24,
+                      help="Max sampled trials for focused LoRA+AdamW+cosine checks.")
+  parser.add_argument("--focus_lora_adamw_lrs", type=str, default="5e-5,1e-4,2e-4,3e-4",
+                      help="Comma-separated LR list for focused LoRA+AdamW+cosine checks.")
+  parser.add_argument("--focus_lora_adamw_weight_decays", type=str, default="0.0,0.01,0.05",
+                      help="Comma-separated weight decay list for focused LoRA+AdamW+cosine checks.")
+  parser.add_argument("--focus_lora_adamw_warmup_steps", type=str, default="0,10,20,50",
+                      help="Comma-separated warmup steps list for focused LoRA+AdamW+cosine checks.")
+  parser.add_argument("--focus_lora_adamw_rs", type=str, default="4,8,16",
+                      help="Comma-separated LoRA rank list for focused checks.")
+  parser.add_argument("--focus_lora_adamw_alphas", type=str, default="16,32",
+                      help="Comma-separated LoRA alpha list for focused checks.")
+  parser.add_argument("--focus_lora_adamw_dropouts", type=str, default="0.0,0.05,0.1",
+                      help="Comma-separated LoRA dropout list for focused checks.")
 
   args = parser.parse_args()
   return args
@@ -866,7 +1014,9 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  if args.run_tuned_then_compare:
+  if args.run_lora_adamw_focus_checks:
+    run_lora_adamw_focus_checks(args)
+  elif args.run_tuned_then_compare:
     run_tuned_then_compare(args)
   elif args.run_experiments:
     run_experiments(args)
