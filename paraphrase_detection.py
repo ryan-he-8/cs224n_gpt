@@ -883,6 +883,93 @@ def run_lora_adamw_focus_checks(args):
         f"dev_yes_rate={best_row.get('dev_yes_rate', 0.0):.3f}")
 
 
+def build_final_configs_from_best(args, best_configs):
+  final_configs = []
+  for base in get_base_experiment_configs():
+    method_name = format_run_name(base)
+    best = best_configs.get(method_name, {})
+    cfg = {
+      **base,
+      "run_name": f"{method_name}-final",
+      "lr": float(best.get("lr", args.lr)),
+      "weight_decay": float(best.get("weight_decay", args.weight_decay)),
+      "warmup_steps": int(best.get("warmup_steps", args.warmup_steps)),
+      "lora_r": int(best.get("lora_r", args.lora_r)),
+      "lora_alpha": float(best.get("lora_alpha", args.lora_alpha)),
+      "lora_dropout": float(best.get("lora_dropout", args.lora_dropout)),
+    }
+    final_configs.append(cfg)
+  return final_configs
+
+
+def run_final_full_dataset(args):
+  if not os.path.exists(args.best_configs_path):
+    raise FileNotFoundError(
+      f"Could not find best-config file at {args.best_configs_path}. "
+      "Run tuning first or pass --best_configs_path."
+    )
+
+  with open(args.best_configs_path, "r") as f:
+    best_configs = json.load(f)
+
+  full_args = copy.deepcopy(args)
+  full_args.train_subset_size = 0
+  full_args.dev_subset_size = 0
+  full_args.test_subset_size = 0
+  if args.final_epochs > 0:
+    full_args.epochs = args.final_epochs
+
+  final_configs = build_final_configs_from_best(full_args, best_configs)
+  seeds = parse_int_list(args.final_seeds)
+  output_root = os.path.join(args.experiment_dir, "final_full_dataset")
+  os.makedirs(output_root, exist_ok=True)
+
+  all_rows = []
+  for seed in seeds:
+    seed_args = copy.deepcopy(full_args)
+    seed_args.seed = seed
+    seed_dir = os.path.join(output_root, f"seed_{seed}")
+    summary_rows, _ = run_config_set(
+      seed_args, final_configs, seed_dir, run_prefix=f"final_s{seed}", generate_plots=True
+    )
+    for row in summary_rows:
+      row["seed"] = seed
+    all_rows.extend(summary_rows)
+
+  if all_rows:
+    summary_path = os.path.join(output_root, "final_full_summary_all_seeds.csv")
+    write_experiment_csv(all_rows, summary_path)
+
+    grouped = {}
+    for row in all_rows:
+      grouped.setdefault(row["run_name"], []).append(row)
+
+    agg_rows = []
+    for run_name, rows in grouped.items():
+      f1_vals = [float(r["best_dev_f1"]) for r in rows]
+      acc_vals = [float(r["dev_acc"]) for r in rows]
+      loss_vals = [float(r["best_dev_loss"]) for r in rows]
+      agg_rows.append({
+        "run_name": run_name,
+        "num_seeds": len(rows),
+        "mean_best_dev_f1": float(np.mean(f1_vals)),
+        "std_best_dev_f1": float(np.std(f1_vals)),
+        "mean_dev_acc": float(np.mean(acc_vals)),
+        "std_dev_acc": float(np.std(acc_vals)),
+        "mean_best_dev_loss": float(np.mean(loss_vals)),
+        "std_best_dev_loss": float(np.std(loss_vals)),
+      })
+
+    agg_rows = sorted(agg_rows, key=lambda r: r["mean_best_dev_f1"], reverse=True)
+    agg_path = os.path.join(output_root, "final_full_summary_aggregated.csv")
+    write_experiment_csv(agg_rows, agg_path)
+
+    print("\nFinal full-dataset artifacts:")
+    print(f"- {summary_path}")
+    print(f"- {agg_path}")
+    print(f"- per-seed outputs under {output_root}/seed_<seed>")
+
+
 def run_experiments(args):
   args = apply_experiment_defaults(args)
   base_configs = get_base_experiment_configs()
@@ -940,6 +1027,8 @@ def get_args():
                       help="Phase 1: tune each method. Phase 2: controlled and tuned-best 4-way comparisons.")
   parser.add_argument("--run_lora_adamw_focus_checks", action='store_true',
                       help="Focused hyperparameter sweep and diagnostics for LoRA+AdamW+cosine.")
+  parser.add_argument("--run_final_full_dataset", action='store_true',
+                      help="Run final full-dataset training for all 4 methods using tuned best hyperparameters.")
   parser.add_argument("--experiment_dir", type=str, default="results/paraphrase_experiments",
                       help="Directory for experiment outputs.")
   parser.add_argument("--tuning_metric", type=str, choices=["best_dev_f1", "dev_acc"], default="best_dev_f1",
@@ -986,6 +1075,13 @@ def get_args():
                       help="Comma-separated LoRA alpha list for focused checks.")
   parser.add_argument("--focus_lora_adamw_dropouts", type=str, default="0.0,0.05,0.1",
                       help="Comma-separated LoRA dropout list for focused checks.")
+  parser.add_argument("--best_configs_path", type=str,
+                      default="results/paraphrase_tuned_then_compare_small/phase1_tuning_updated/best_configs.json",
+                      help="Path to tuned best-config JSON used by --run_final_full_dataset.")
+  parser.add_argument("--final_epochs", type=int, default=8,
+                      help="Epochs for final full-dataset runs (<=0 keeps --epochs value).")
+  parser.add_argument("--final_seeds", type=str, default="11711",
+                      help="Comma-separated seeds for final full-dataset runs.")
 
   args = parser.parse_args()
   return args
@@ -1014,7 +1110,9 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  if args.run_lora_adamw_focus_checks:
+  if args.run_final_full_dataset:
+    run_final_full_dataset(args)
+  elif args.run_lora_adamw_focus_checks:
     run_lora_adamw_focus_checks(args)
   elif args.run_tuned_then_compare:
     run_tuned_then_compare(args)
