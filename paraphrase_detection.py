@@ -120,6 +120,8 @@ class ParaphraseGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
+    if args.use_lora and args.use_last_layer:
+      raise ValueError("use_lora and use_last_layer cannot both be enabled.")
     if args.use_lora:
       self.gpt = GPT2ModelLoRA.from_pretrained(
         model=args.model_size,
@@ -143,6 +145,10 @@ class ParaphraseGPT(nn.Module):
       for name, param in self.gpt.named_parameters():
         if "lora_" in name:
           param.requires_grad = True
+    elif args.use_last_layer:
+      # Last-layer tuning: freeze GPT-2 backbone, train only classification head.
+      for param in self.gpt.parameters():
+        param.requires_grad = False
     else:
       for param in self.gpt.parameters():
         param.requires_grad = True
@@ -399,7 +405,12 @@ def get_base_experiment_configs():
 
 
 def format_run_name(config):
-  model_label = "lora" if config["use_lora"] else "full"
+  if config.get("use_lora", False):
+    model_label = "lora"
+  elif config.get("use_last_layer", False):
+    model_label = "last-layer"
+  else:
+    model_label = "full"
   opt_label = f'{config["optim_algorithm"]}-cosine' if config["use_scheduler"] else config["optim_algorithm"]
   return f"{model_label}-{opt_label}"
 
@@ -516,7 +527,12 @@ def plot_performance_bars(summary_rows, out_path):
 def plot_parameter_efficiency(summary_rows, out_path):
   plt.figure(figsize=(7.5, 5))
   for row in summary_rows:
-    marker = "o" if row["use_lora"] else "s"
+    if row.get("use_lora", False):
+      marker = "o"
+    elif row.get("use_last_layer", False):
+      marker = "^"
+    else:
+      marker = "s"
     plt.scatter(row["trainable_params"], row["best_dev_f1"], s=80, marker=marker, label=row["run_name"])
     plt.annotate(row["run_name"], (row["trainable_params"], row["best_dev_f1"]), fontsize=8)
 
@@ -566,6 +582,7 @@ def run_config_set(args, experiment_configs, output_dir, run_prefix="run", gener
   for idx, config in enumerate(experiment_configs):
     run_args = copy.deepcopy(args)
     run_args.use_lora = config["use_lora"]
+    run_args.use_last_layer = config.get("use_last_layer", False)
     run_args.optim_algorithm = config["optim_algorithm"]
     run_args.use_scheduler = config["use_scheduler"]
     run_args.scheduler_type = config["scheduler_type"]
@@ -616,6 +633,7 @@ def run_config_set(args, experiment_configs, output_dir, run_prefix="run", gener
       "run_id": idx + 1,
       "run_name": run_name,
       "use_lora": bool(config["use_lora"]),
+      "use_last_layer": bool(config.get("use_last_layer", False)),
       "optim_algorithm": config["optim_algorithm"],
       "use_scheduler": bool(config["use_scheduler"]),
       "scheduler_type": config["scheduler_type"],
@@ -902,6 +920,158 @@ def build_final_configs_from_best(args, best_configs):
   return final_configs
 
 
+def get_last_layer_base_configs():
+  return [
+    {"use_lora": False, "use_last_layer": True, "optim_algorithm": "adam", "use_scheduler": False, "scheduler_type": "linear"},
+    {"use_lora": False, "use_last_layer": True, "optim_algorithm": "adamw", "use_scheduler": True, "scheduler_type": "cosine"},
+  ]
+
+
+def build_last_layer_tuning_candidates(args, base_config, method_index):
+  lr_values = parse_float_list(args.tune_last_layer_lrs)
+  if base_config["optim_algorithm"] == "adamw":
+    weight_decay_values = parse_float_list(args.tune_weight_decays)
+    warmup_values = parse_int_list(args.tune_warmup_steps)
+  else:
+    weight_decay_values = [args.weight_decay]
+    warmup_values = [args.warmup_steps]
+
+  candidates = []
+  for lr, wd, wu in itertools.product(lr_values, weight_decay_values, warmup_values):
+    candidates.append({
+      **base_config,
+      "lr": lr,
+      "weight_decay": wd,
+      "warmup_steps": wu,
+    })
+
+  candidates = sample_candidates(candidates, args.last_layer_max_tuning_trials, args.seed + 3000 + method_index)
+  for i, candidate in enumerate(candidates):
+    candidate["run_name"] = f"{format_run_name(base_config)}-trial{i + 1}"
+  return candidates
+
+
+def run_last_layer_tuned_then_final(args):
+  args = apply_experiment_defaults(args)
+  os.makedirs(args.experiment_dir, exist_ok=True)
+  base_configs = get_last_layer_base_configs()
+
+  tuning_args = copy.deepcopy(args)
+  if args.last_layer_tuning_epochs > 0:
+    tuning_args.epochs = args.last_layer_tuning_epochs
+  elif args.tuning_epochs > 0:
+    tuning_args.epochs = args.tuning_epochs
+
+  pipeline_root = os.path.join(args.experiment_dir, "last_layer_tuning_then_final")
+  tuning_root = os.path.join(pipeline_root, "phase1_tuning")
+  os.makedirs(tuning_root, exist_ok=True)
+
+  tuning_trial_rows = []
+  best_config_map = {}
+  for method_idx, base_config in enumerate(base_configs):
+    method_name = format_run_name(base_config)
+    method_dir = os.path.join(tuning_root, f"method_{method_idx + 1}_{method_name}")
+    candidates = build_last_layer_tuning_candidates(tuning_args, base_config, method_idx)
+    print(f"\nTuning {method_name}: {len(candidates)} trial(s)")
+    trial_summary_rows, _ = run_config_set(
+      tuning_args, candidates, method_dir, run_prefix="trial", generate_plots=False
+    )
+    for row in trial_summary_rows:
+      row["phase"] = "tuning"
+      row["method_name"] = method_name
+      tuning_trial_rows.append(row)
+
+    min_yes = args.selection_min_yes_rate if args.enforce_prediction_balance else 0.0
+    max_yes = args.selection_max_yes_rate if args.enforce_prediction_balance else 1.0
+    best_row = pick_best_row(trial_summary_rows, args.tuning_metric, min_yes_rate=min_yes, max_yes_rate=max_yes)
+    best_config_map[method_name] = {
+      "lr": best_row["lr"],
+      "weight_decay": best_row["weight_decay"],
+      "warmup_steps": best_row["warmup_steps"],
+      "selected_metric": best_row[args.tuning_metric],
+      "best_dev_f1": best_row["best_dev_f1"],
+      "dev_acc": best_row["dev_acc"],
+      "dev_yes_rate": best_row.get("dev_yes_rate", 0.0),
+      "best_dev_loss": best_row["best_dev_loss"],
+      "run_name": best_row["run_name"],
+    }
+
+  write_experiment_csv(tuning_trial_rows, os.path.join(tuning_root, "all_tuning_trials.csv"))
+  best_path = os.path.join(tuning_root, "best_configs.json")
+  with open(best_path, "w") as f:
+    json.dump(best_config_map, f, indent=2)
+
+  final_args = copy.deepcopy(args)
+  final_args.train_subset_size = 0
+  final_args.dev_subset_size = 0
+  final_args.test_subset_size = 0
+  if args.last_layer_final_epochs > 0:
+    final_args.epochs = args.last_layer_final_epochs
+  elif args.final_epochs > 0:
+    final_args.epochs = args.final_epochs
+
+  final_configs = []
+  for base in base_configs:
+    method_name = format_run_name(base)
+    best = best_config_map[method_name]
+    final_configs.append({
+      **base,
+      "run_name": f"{method_name}-final",
+      "lr": float(best["lr"]),
+      "weight_decay": float(best["weight_decay"]),
+      "warmup_steps": int(best["warmup_steps"]),
+    })
+
+  final_root = os.path.join(pipeline_root, "phase2_final_full")
+  os.makedirs(final_root, exist_ok=True)
+  seeds = parse_int_list(args.final_seeds)
+  all_rows = []
+  for seed in seeds:
+    seed_args = copy.deepcopy(final_args)
+    seed_args.seed = seed
+    seed_dir = os.path.join(final_root, f"seed_{seed}")
+    summary_rows, _ = run_config_set(
+      seed_args, final_configs, seed_dir, run_prefix=f"final_s{seed}", generate_plots=True
+    )
+    for row in summary_rows:
+      row["seed"] = seed
+      row["phase"] = "final_full"
+    all_rows.extend(summary_rows)
+
+  summary_path = os.path.join(final_root, "final_summary_all_seeds.csv")
+  write_experiment_csv(all_rows, summary_path)
+
+  grouped = {}
+  for row in all_rows:
+    grouped.setdefault(row["run_name"], []).append(row)
+
+  agg_rows = []
+  for run_name, rows in grouped.items():
+    f1_vals = [float(r["best_dev_f1"]) for r in rows]
+    acc_vals = [float(r["dev_acc"]) for r in rows]
+    loss_vals = [float(r["best_dev_loss"]) for r in rows]
+    agg_rows.append({
+      "run_name": run_name,
+      "num_seeds": len(rows),
+      "mean_best_dev_f1": float(np.mean(f1_vals)),
+      "std_best_dev_f1": float(np.std(f1_vals)),
+      "mean_dev_acc": float(np.mean(acc_vals)),
+      "std_dev_acc": float(np.std(acc_vals)),
+      "mean_best_dev_loss": float(np.mean(loss_vals)),
+      "std_best_dev_loss": float(np.std(loss_vals)),
+    })
+  agg_rows = sorted(agg_rows, key=lambda r: r["mean_best_dev_f1"], reverse=True)
+  agg_path = os.path.join(final_root, "final_summary_aggregated.csv")
+  write_experiment_csv(agg_rows, agg_path)
+
+  print("\nLast-layer tuning + final artifacts:")
+  print(f"- Tuning trials: {os.path.join(tuning_root, 'all_tuning_trials.csv')}")
+  print(f"- Tuning best configs: {best_path}")
+  print(f"- Final per-seed summary: {summary_path}")
+  print(f"- Final aggregated summary: {agg_path}")
+  print(f"- Final run dirs: {final_root}/seed_<seed>")
+
+
 def run_final_full_dataset(args):
   if not os.path.exists(args.best_configs_path):
     raise FileNotFoundError(
@@ -1010,6 +1180,8 @@ def get_args():
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
   parser.add_argument("--use_lora", action='store_true', help="Enable LoRA adapters in GPT-2 attention layers.")
+  parser.add_argument("--use_last_layer", action='store_true',
+                      help="Freeze GPT-2 backbone and tune only the task classification head.")
   parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
   parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA scaling factor.")
   parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
@@ -1027,6 +1199,8 @@ def get_args():
                       help="Phase 1: tune each method. Phase 2: controlled and tuned-best 4-way comparisons.")
   parser.add_argument("--run_lora_adamw_focus_checks", action='store_true',
                       help="Focused hyperparameter sweep and diagnostics for LoRA+AdamW+cosine.")
+  parser.add_argument("--run_last_layer_tuned_then_final", action='store_true',
+                      help="Tune last-layer (Adam and AdamW+cosine), then run final full-dataset training.")
   parser.add_argument("--run_final_full_dataset", action='store_true',
                       help="Run final full-dataset training for all 4 methods using tuned best hyperparameters.")
   parser.add_argument("--experiment_dir", type=str, default="results/paraphrase_experiments",
@@ -1053,6 +1227,14 @@ def get_args():
                       help="Comma-separated LoRA alpha list.")
   parser.add_argument("--tune_lora_dropouts", type=str, default="0.0,0.1",
                       help="Comma-separated LoRA dropout list.")
+  parser.add_argument("--tune_last_layer_lrs", type=str, default="5e-5,1e-4,2e-4,5e-4,1e-3",
+                      help="Comma-separated LR list for last-layer tuning.")
+  parser.add_argument("--last_layer_max_tuning_trials", type=int, default=12,
+                      help="Max sampled tuning trials per last-layer method.")
+  parser.add_argument("--last_layer_tuning_epochs", type=int, default=6,
+                      help="Epochs for phase-1 last-layer hyperparameter tuning.")
+  parser.add_argument("--last_layer_final_epochs", type=int, default=20,
+                      help="Epochs for phase-2 full-dataset last-layer final runs.")
   parser.add_argument("--enforce_prediction_balance", action='store_true',
                       help="When selecting best trial, prefer runs with dev yes-rate inside configured bounds.")
   parser.add_argument("--selection_min_yes_rate", type=float, default=0.05,
@@ -1110,7 +1292,9 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  if args.run_final_full_dataset:
+  if args.run_last_layer_tuned_then_final:
+    run_last_layer_tuned_then_final(args)
+  elif args.run_final_full_dataset:
     run_final_full_dataset(args)
   elif args.run_lora_adamw_focus_checks:
     run_lora_adamw_focus_checks(args)
