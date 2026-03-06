@@ -1,0 +1,3 @@
+run_name,num_seeds,mean_best_dev_f1,std_best_dev_f1,mean_dev_acc,std_dev_acc,mean_best_dev_loss,std_best_dev_loss
+last-layer-adamw-cosine-final,1,0.6649436443195778,0.0,0.7161690865467857,0.0,0.5581836211335347,0.0
+last-layer-adam-final,1,0.6625637075648163,0.0,0.7165895767889386,0.0,0.5545368441172199,0.0

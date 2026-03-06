@@ -1,0 +1,24 @@
+{
+  "last-layer-adam": {
+    "lr": 0.0005,
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "selected_metric": 0.626657646314497,
+    "best_dev_f1": 0.626657646314497,
+    "dev_acc": 0.62,
+    "dev_yes_rate": 0.0,
+    "best_dev_loss": 0.6462943780422211,
+    "run_name": "last-layer-adam-trial4"
+  },
+  "last-layer-adamw-cosine": {
+    "lr": 0.0005,
+    "weight_decay": 0.01,
+    "warmup_steps": 50,
+    "selected_metric": 0.611494861815786,
+    "best_dev_f1": 0.611494861815786,
+    "dev_acc": 0.62,
+    "dev_yes_rate": 0.0,
+    "best_dev_loss": 0.6415460914373398,
+    "run_name": "last-layer-adamw-cosine-trial1"
+  }
+}
