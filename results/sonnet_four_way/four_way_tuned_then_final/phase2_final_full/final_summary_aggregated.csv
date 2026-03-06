@@ -1,0 +1,5 @@
+run_name,num_seeds,mean_best_dev_loss,std_best_dev_loss,mean_best_dev_ppl,std_best_dev_ppl
+full-adamw-cosine-final,1,4.2615533276139015,0.0,70.92006002727328,0.0
+full-adam-final,1,4.264595103041034,0.0,71.13611134636902,0.0
+lora-adam-final,1,4.331956809926256,0.0,76.09304059720138,0.0
+lora-adamw-cosine-final,1,4.396899357020298,0.0,81.19870973028777,0.0

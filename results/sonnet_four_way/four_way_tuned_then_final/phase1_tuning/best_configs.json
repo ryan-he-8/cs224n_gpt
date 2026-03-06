@@ -1,0 +1,46 @@
+{
+  "full-adam": {
+    "lr": 3e-05,
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "best_dev_loss": 4.264595103041034,
+    "best_dev_ppl": 71.13611134636902,
+    "run_name": "full-adam-trial3"
+  },
+  "full-adamw-cosine": {
+    "lr": 2e-05,
+    "weight_decay": 0.01,
+    "warmup_steps": 20,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "best_dev_loss": 4.272240611994378,
+    "best_dev_ppl": 71.68206751954668,
+    "run_name": "full-adamw-cosine-trial7"
+  },
+  "lora-adam": {
+    "lr": 0.0003,
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "lora_r": 16,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.0,
+    "best_dev_loss": 4.331956809926256,
+    "best_dev_ppl": 76.09304059720138,
+    "run_name": "lora-adam-trial2"
+  },
+  "lora-adamw-cosine": {
+    "lr": 0.0003,
+    "weight_decay": 0.05,
+    "warmup_steps": 10,
+    "lora_r": 8,
+    "lora_alpha": 32.0,
+    "lora_dropout": 0.05,
+    "best_dev_loss": 4.391829731308412,
+    "best_dev_ppl": 80.78810435087883,
+    "run_name": "lora-adamw-cosine-trial8"
+  }
+}
