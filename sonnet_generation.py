@@ -463,8 +463,11 @@ def build_candidates(args, base_config, method_index):
   return candidates
 
 
-def run_config_set(args, configs, output_dir, run_prefix="run", generate_plots=True):
+def run_config_set(args, configs, output_dir, run_prefix="run", generate_plots=True, generate_sonnets=False):
   os.makedirs(output_dir, exist_ok=True)
+  sonnet_dir = os.path.join(output_dir, "generated_sonnets")
+  if generate_sonnets:
+    os.makedirs(sonnet_dir, exist_ok=True)
   summary_rows, history_rows = [], []
 
   for i, cfg in enumerate(configs):
@@ -488,6 +491,12 @@ def run_config_set(args, configs, output_dir, run_prefix="run", generate_plots=T
     print("=" * 80)
 
     train_info = train_one_config(run_args)
+    generated_sonnet_path = ""
+    if generate_sonnets:
+      generated_sonnet_path = os.path.join(sonnet_dir, f"{run_prefix}_{i + 1}_{run_name}.txt")
+      run_args.sonnet_out = generated_sonnet_path
+      generate_submission_sonnets(run_args, run_args.filepath)
+
     summary_rows.append({
       "run_id": i + 1,
       "run_name": run_name,
@@ -510,6 +519,7 @@ def run_config_set(args, configs, output_dir, run_prefix="run", generate_plots=T
       "total_params": train_info["total_params"],
       "trainable_params": train_info["trainable_params"],
       "checkpoint_path": run_args.filepath,
+      "generated_sonnet_path": generated_sonnet_path,
     })
     for h in train_info["history"]:
       history_rows.append({"run_id": i + 1, "run_name": run_name, **h})
@@ -602,7 +612,14 @@ def run_four_way_tuned_then_final(args):
     seed_args = copy.deepcopy(final_args)
     seed_args.seed = seed
     seed_dir = os.path.join(final_root, f"seed_{seed}")
-    summary_rows, _ = run_config_set(seed_args, final_configs, seed_dir, run_prefix=f"final_s{seed}", generate_plots=True)
+    summary_rows, _ = run_config_set(
+      seed_args,
+      final_configs,
+      seed_dir,
+      run_prefix=f"final_s{seed}",
+      generate_plots=True,
+      generate_sonnets=True,
+    )
     for row in summary_rows:
       row["seed"] = seed
       row["phase"] = "final_full"
